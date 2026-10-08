@@ -8,6 +8,7 @@
 //! - Metadata role for receiving track info
 
 pub mod devices;
+pub mod identity;
 mod now_playing_state;
 pub mod volume_control;
 
@@ -29,8 +30,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 use sendspin::audio::decode::{Decoder, PcmDecoder};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientState, ClientSyncState, Message, PlayerCommandType, PlayerState,
-    PlayerStateCommand, PlayerV1Support, ServerCommand,
+    AudioFormatSpec, Message, PlayerCommandType, PlayerState, PlayerStateCommand, PlayerV1Support,
+    ServerCommand,
 };
 use sendspin::sync::ClockSync;
 use sendspin::{Connection, ProtocolClientBuilder, WsSender};
@@ -338,34 +339,35 @@ fn clamp_static_delay_ms(sync_delay_ms: i32) -> u16 {
     sync_delay_ms.clamp(0, 5_000) as u16
 }
 
-fn supported_volume_commands(resolved_mode: ResolvedVolumeMode) -> Vec<String> {
-    match resolved_mode {
+fn supported_player_commands(resolved_mode: ResolvedVolumeMode) -> Vec<PlayerStateCommand> {
+    let mut commands = match resolved_mode {
+        // Only advertise volume support if hardware/software control is available.
         ResolvedVolumeMode::Hardware | ResolvedVolumeMode::Software => {
-            vec!["volume".to_string(), "mute".to_string()]
+            vec![PlayerStateCommand::Volume, PlayerStateCommand::Mute]
         }
         ResolvedVolumeMode::None => vec![],
-    }
+    };
+    commands.push(PlayerStateCommand::SetOutputDelay);
+    commands
 }
 
-fn build_player_support(
-    supported_formats: Vec<AudioFormatSpec>,
-    supported_commands: Vec<String>,
-) -> PlayerV1Support {
+fn build_player_support(supported_formats: Vec<AudioFormatSpec>) -> PlayerV1Support {
     PlayerV1Support {
         supported_formats,
         // Maximum audio buffer capacity advertised to the server, in bytes.
         // 16 MiB gives generous desktop PCM headroom without requiring prefill.
         buffer_capacity: PLAYER_BUFFER_CAPACITY,
-        // Only advertise volume support if hardware/software control is available.
-        supported_commands,
     }
 }
 
-fn build_initial_player_state(
+/// The full `client/state` player object. Every player object sent carries
+/// the player's complete state, so volume, mute and delay always travel
+/// together.
+fn build_player_state(
     resolved_mode: ResolvedVolumeMode,
     volume: u8,
     muted: bool,
-    sync_delay_ms: i32,
+    output_delay_ms: u16,
 ) -> PlayerState {
     let report_volume = (resolved_mode != ResolvedVolumeMode::None).then_some(volume);
     let report_muted = (resolved_mode != ResolvedVolumeMode::None).then_some(muted);
@@ -373,20 +375,23 @@ fn build_initial_player_state(
     PlayerState {
         volume: report_volume,
         muted: report_muted,
-        static_delay_ms: Some(clamp_static_delay_ms(sync_delay_ms)),
-        required_lead_time_ms: Some(REQUIRED_LEAD_TIME_MS),
-        min_buffer_ms: Some(MIN_BUFFER_MS),
-        supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
+        output_delay_ms,
+        required_lead_time_ms: REQUIRED_LEAD_TIME_MS,
+        min_buffer_ms: MIN_BUFFER_MS,
+        supported_commands: supported_player_commands(resolved_mode),
+        format: None,
     }
 }
 
 fn build_protocol_client_builder(
     config: &SendspinConfig,
+    credentials: sendspin::ClientCredentials,
     player_support: PlayerV1Support,
     initial_player_state: PlayerState,
 ) -> ProtocolClientBuilder {
     ProtocolClientBuilder::builder()
-        .client_id(config.player_id.clone())
+        .credentials(credentials)
+        .pairing_store(identity::pairing_store())
         .name(config.player_name.clone())
         .product_name(Some(config.player_name.clone()))
         .manufacturer(Some("Music Assistant".to_string()))
@@ -581,9 +586,6 @@ async fn run_client(
         }
     }
 
-    // Build supported commands list based on resolved volume mode.
-    let supported_commands = supported_volume_commands(resolved_mode);
-
     // Resolve output device once per connection and derive supported formats for this device.
     // This avoids negotiating formats that the selected Windows output cannot open.
     let output_device = devices::resolve_output_device(config.audio_device_id.as_deref());
@@ -612,15 +614,17 @@ async fn run_client(
     }
 
     let (initial_volume, initial_muted) = initial_volume_state(resolved_mode);
-    let player_support = build_player_support(supported_formats, supported_commands);
-    let initial_player_state = build_initial_player_state(
+    let player_support = build_player_support(supported_formats);
+    let initial_player_state = build_player_state(
         resolved_mode,
         initial_volume,
         initial_muted,
-        config.sync_delay_ms,
+        clamp_static_delay_ms(config.sync_delay_ms),
     );
+    let credentials = identity::credentials()?;
+    let pairing_token = credentials.pairing_token();
     let protocol_builder =
-        build_protocol_client_builder(&config, player_support, initial_player_state);
+        build_protocol_client_builder(&config, credentials, player_support, initial_player_state);
 
     // Connect to WebSocket and authenticate with MA proxy
     log::info!(
@@ -697,7 +701,25 @@ async fn run_client(
     let connection = protocol_client.split();
 
     update_status(ConnectionStatus::Connected);
-    log::info!("[Sendspin] Connected to server (player {})", player_id);
+    log::info!(
+        "[Sendspin] Connected to server {} (player {}, paired={})",
+        connection.session.server_id,
+        player_id,
+        connection.session.paired
+    );
+
+    // An unpaired session has no roles yet. Ask MA to pair this client the
+    // same way the built-in web player does: MA re-keys the connection with
+    // the pairing PSK from our token and we hand it a long-term PSK, which
+    // the pairing store keeps for the next connection.
+    if !connection.session.paired {
+        tokio::task::spawn_blocking(
+            move || match crate::ma_api::pair_web_player(&pairing_token) {
+                Ok(()) => log::info!("[Sendspin] Pairing with Music Assistant requested"),
+                Err(e) => log::error!("[Sendspin] Pairing with Music Assistant failed: {e}"),
+            },
+        );
+    }
 
     // The cpal::Device resolved above is intentionally not passed onward.
     // It exists only to drive the capability advertisement (which needs
@@ -781,27 +803,19 @@ fn save_static_delay_state(static_delay_ms: u16) {
     }
 }
 
-/// Build a `ClientState` message echoing the current volume/mute state back to the server.
-fn build_volume_state_msg(volume: u8, muted: bool) -> Message {
-    Message::ClientState(ClientState {
-        state: Some(ClientSyncState::Synchronized),
-        player: Some(PlayerState {
-            volume: Some(volume),
-            muted: Some(muted),
-            ..PlayerState::default()
-        }),
-    })
-}
-
-/// Build a `ClientState` message echoing the current static sync delay back to the server.
-fn build_static_delay_state_msg(static_delay_ms: u16) -> Message {
-    Message::ClientState(ClientState {
-        state: Some(ClientSyncState::Synchronized),
-        player: Some(PlayerState {
-            static_delay_ms: Some(static_delay_ms),
-            ..PlayerState::default()
-        }),
-    })
+/// Report the player's full state (volume, mute, output delay) to the server.
+async fn send_player_state(
+    sender: &WsSender,
+    resolved_mode: ResolvedVolumeMode,
+    volume: u8,
+    muted: bool,
+    output_delay_ms: u16,
+    what: &str,
+) {
+    let state = build_player_state(resolved_mode, volume, muted, output_delay_ms);
+    if let Err(e) = sender.update_player_state(state).await {
+        log::warn!("[Sendspin] Failed to send {what} state: {e}");
+    }
 }
 
 fn send_player_command(
@@ -897,14 +911,12 @@ async fn broadcast_volume_state(
     resolved_mode: ResolvedVolumeMode,
     volume: u8,
     muted: bool,
+    output_delay_ms: u16,
     what: &str,
 ) {
     publish_volume(volume);
     save_volume_state(resolved_mode, volume, muted);
-    let msg = build_volume_state_msg(volume, muted);
-    if let Err(e) = sender.send_message(msg).await {
-        log::warn!("[Sendspin] Failed to send {what} state: {e}");
-    }
+    send_player_state(sender, resolved_mode, volume, muted, output_delay_ms, what).await;
 }
 
 /// Run the Sendspin client on an already-authenticated WebSocket connection
@@ -965,6 +977,7 @@ async fn run_authenticated_client(
     // Volume state — initialized from the same read used for the initial ClientState
     let mut current_volume: u8 = initial_volume;
     let mut current_muted: bool = initial_muted;
+    let mut current_delay_ms: u16 = initial_static_delay_ms;
     publish_volume(current_volume);
 
     loop {
@@ -998,10 +1011,8 @@ async fn run_authenticated_client(
                     ClientCommand::SetStaticDelay(delay_ms) => {
                         log::debug!("[Sendspin] Applying static delay: {}ms", delay_ms);
                         if send_player_command(&player_tx, PlayerCommand::SetStaticDelay(delay_ms), "set static delay") {
-                            let msg = build_static_delay_state_msg(delay_ms);
-                            if let Err(e) = sender.send_message(msg).await {
-                                log::warn!("[Sendspin] Failed to send static delay state: {}", e);
-                            }
+                            current_delay_ms = delay_ms;
+                            send_player_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "output delay").await;
                         }
                     }
                     ClientCommand::SetVolume(volume) => {
@@ -1009,7 +1020,7 @@ async fn run_authenticated_client(
                         log::debug!("[Sendspin] Applying app volume command: {}%", volume);
                         if apply_volume(resolved_mode, &player_tx, volume, "app") {
                             current_volume = volume;
-                            broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, "app volume").await;
+                            broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "app volume").await;
                         } else {
                             // The set was rejected; snap the requesting
                             // surface back to the actual value.
@@ -1027,7 +1038,7 @@ async fn run_authenticated_client(
                     log::debug!("[Sendspin] OS volume changed: {}%, muted: {}", volume, muted);
                     current_volume = volume;
                     current_muted = muted;
-                    broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, "hardware volume").await;
+                    broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "hardware volume").await;
                 }
             }
             Some(msg) = messages.recv() => {
@@ -1073,7 +1084,7 @@ async fn run_authenticated_client(
                     Message::ServerState(state) => {
                         if let Some(md) = state.metadata {
                             log::trace!("[Sendspin] Server metadata update received");
-                            np_state.apply_metadata(&md);
+                            np_state.apply_metadata(md.as_ref());
                             now_playing::update_now_playing(np_state.snapshot());
                         }
                     }
@@ -1081,18 +1092,16 @@ async fn run_authenticated_client(
                         log::debug!("[Sendspin] Server stream end/clear");
                         send_player_command(&player_tx, PlayerCommand::Clear, "clear player");
                     }
-                    Message::ServerCommand(ServerCommand { player: Some(player_cmd) }) => {
-                        if player_cmd.command == PlayerCommandType::SetStaticDelay {
-                            if let Some(static_delay_ms) = player_cmd.static_delay_ms {
-                                let delay_ms = clamp_static_delay_ms(i32::from(static_delay_ms));
-                                log::debug!("[Sendspin] Server static delay command: {}ms", delay_ms);
+                    Message::ServerCommand(ServerCommand { player: Some(player_cmd), .. }) => {
+                        if player_cmd.command == PlayerCommandType::SetOutputDelay {
+                            if let Some(output_delay_ms) = player_cmd.output_delay_ms {
+                                let delay_ms = clamp_static_delay_ms(i32::from(output_delay_ms));
+                                log::debug!("[Sendspin] Server output delay command: {}ms", delay_ms);
 
                                 if send_player_command(&player_tx, PlayerCommand::SetStaticDelay(delay_ms), "set static delay") {
                                     save_static_delay_state(delay_ms);
-                                    let msg = build_static_delay_state_msg(delay_ms);
-                                    if let Err(e) = sender.send_message(msg).await {
-                                        log::warn!("[Sendspin] Failed to send static delay state: {}", e);
-                                    }
+                                    current_delay_ms = delay_ms;
+                                    send_player_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "output delay").await;
                                 }
                             }
                         }
@@ -1106,7 +1115,7 @@ async fn run_authenticated_client(
 
                                 if success {
                                     current_volume = vol;
-                                    broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, "server volume").await;
+                                    broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "server volume").await;
                                 }
                             }
                         }
@@ -1142,7 +1151,7 @@ async fn run_authenticated_client(
 
                                 if success {
                                     current_muted = mute;
-                                    broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, "mute").await;
+                                    broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "mute").await;
                                 }
                             }
                         }
@@ -1323,7 +1332,7 @@ fn run_playback_thread(
 
                 match SyncedPlayer::new(format.clone(), Arc::clone(&clock_sync), player_config) {
                     Ok(player) => {
-                        player.set_static_delay(static_delay_ms);
+                        player.set_output_delay(static_delay_ms);
                         log::info!(
                             "[Sendspin] Audio player created: channels={}, sample_rate={}, bit_depth={}, static_delay_ms={}",
                             format.channels,
@@ -1371,7 +1380,7 @@ fn run_playback_thread(
             Ok(PlayerCommand::SetStaticDelay(delay_ms)) => {
                 static_delay_ms = delay_ms;
                 if let Some(ref player) = synced_player {
-                    player.set_static_delay(delay_ms);
+                    player.set_output_delay(delay_ms);
                 }
             }
             Ok(PlayerCommand::Shutdown) | Err(_) => {
@@ -1640,18 +1649,23 @@ mod tests {
     }
 
     #[test]
-    fn supported_volume_commands_match_resolved_mode() {
+    fn supported_player_commands_match_resolved_mode() {
+        let with_volume = vec![
+            PlayerStateCommand::Volume,
+            PlayerStateCommand::Mute,
+            PlayerStateCommand::SetOutputDelay,
+        ];
         assert_eq!(
-            supported_volume_commands(ResolvedVolumeMode::Hardware),
-            vec!["volume".to_string(), "mute".to_string()]
+            supported_player_commands(ResolvedVolumeMode::Hardware),
+            with_volume
         );
         assert_eq!(
-            supported_volume_commands(ResolvedVolumeMode::Software),
-            vec!["volume".to_string(), "mute".to_string()]
+            supported_player_commands(ResolvedVolumeMode::Software),
+            with_volume
         );
         assert_eq!(
-            supported_volume_commands(ResolvedVolumeMode::None),
-            Vec::<String>::new()
+            supported_player_commands(ResolvedVolumeMode::None),
+            vec![PlayerStateCommand::SetOutputDelay]
         );
     }
 
@@ -1704,58 +1718,42 @@ mod tests {
     }
 
     #[test]
-    fn test_build_volume_state_msg_produces_client_state() {
-        let msg = build_volume_state_msg(75, false);
-        let value = serde_json::to_value(&msg).unwrap();
-
-        assert_eq!(value["type"], "client/state");
-        assert_eq!(value["payload"]["state"], "synchronized");
-        assert_eq!(value["payload"]["player"]["volume"], 75);
-        assert_eq!(value["payload"]["player"]["muted"], false);
-    }
-
-    #[test]
-    fn test_build_volume_state_msg_muted() {
-        let msg = build_volume_state_msg(0, true);
-        let value = serde_json::to_value(&msg).unwrap();
-
-        assert_eq!(value["payload"]["player"]["volume"], 0);
-        assert_eq!(value["payload"]["player"]["muted"], true);
-    }
-
-    #[test]
-    fn test_build_static_delay_state_msg_produces_client_state() {
-        let msg = build_static_delay_state_msg(250);
-        let value = serde_json::to_value(&msg).unwrap();
-
-        assert_eq!(value["type"], "client/state");
-        assert_eq!(value["payload"]["state"], "synchronized");
-        assert_eq!(value["payload"]["player"]["static_delay_ms"], 250);
-        assert!(value["payload"]["player"].get("volume").is_none());
-        assert!(value["payload"]["player"].get("muted").is_none());
-    }
-
-    #[test]
-    fn initial_player_state_omits_volume_when_volume_control_disabled() {
-        let state = build_initial_player_state(ResolvedVolumeMode::None, 42, true, 123);
+    fn player_state_omits_volume_when_volume_control_disabled() {
+        let state = build_player_state(ResolvedVolumeMode::None, 42, true, 123);
 
         assert_eq!(state.volume, None);
         assert_eq!(state.muted, None);
-        assert_eq!(state.static_delay_ms, Some(123));
-        assert_eq!(state.required_lead_time_ms, Some(REQUIRED_LEAD_TIME_MS));
-        assert_eq!(state.min_buffer_ms, Some(MIN_BUFFER_MS));
+        assert_eq!(state.output_delay_ms, 123);
+        assert_eq!(state.required_lead_time_ms, REQUIRED_LEAD_TIME_MS);
+        assert_eq!(state.min_buffer_ms, MIN_BUFFER_MS);
         assert_eq!(
             state.supported_commands,
-            Some(vec![PlayerStateCommand::SetStaticDelay])
+            vec![PlayerStateCommand::SetOutputDelay]
         );
+        assert!(state.validate().is_ok());
     }
 
     #[test]
-    fn initial_player_state_reports_volume_when_available() {
-        let state = build_initial_player_state(ResolvedVolumeMode::Software, 42, true, 123);
+    fn player_state_reports_volume_when_available() {
+        let state = build_player_state(ResolvedVolumeMode::Software, 42, true, 123);
 
         assert_eq!(state.volume, Some(42));
         assert_eq!(state.muted, Some(true));
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn player_state_serializes_as_full_client_state_player_object() {
+        let state = build_player_state(ResolvedVolumeMode::Hardware, 75, false, 250);
+        let value = serde_json::to_value(&state).unwrap();
+
+        assert_eq!(value["volume"], 75);
+        assert_eq!(value["muted"], false);
+        assert_eq!(value["output_delay_ms"], 250);
+        assert_eq!(
+            value["supported_commands"],
+            serde_json::json!(["volume", "mute", "set_output_delay"])
+        );
     }
 
     #[test]
@@ -1776,9 +1774,7 @@ mod tests {
             sample_rate: 48_000,
             bit_depth: 24,
         }];
-        let commands = vec!["volume".to_string(), "mute".to_string()];
-
-        let support = build_player_support(formats.clone(), commands.clone());
+        let support = build_player_support(formats.clone());
 
         assert_eq!(support.supported_formats.len(), 1);
         assert_eq!(support.supported_formats[0].codec, formats[0].codec);
@@ -1789,7 +1785,6 @@ mod tests {
         );
         assert_eq!(support.supported_formats[0].bit_depth, formats[0].bit_depth);
         assert_eq!(support.buffer_capacity, PLAYER_BUFFER_CAPACITY);
-        assert_eq!(support.supported_commands, commands);
     }
 
     #[test]
@@ -1809,10 +1804,12 @@ mod tests {
             sample_rate: 48_000,
             bit_depth: 16,
         }];
-        let player_support = build_player_support(formats.clone(), vec!["volume".to_string()]);
-        let initial_state = build_initial_player_state(ResolvedVolumeMode::Software, 100, false, 0);
+        let player_support = build_player_support(formats.clone());
+        let initial_state = build_player_state(ResolvedVolumeMode::Software, 100, false, 0);
+        let credentials = sendspin::ClientCredentials::generate().unwrap();
 
-        let builder = build_protocol_client_builder(&config, player_support, initial_state);
+        let builder =
+            build_protocol_client_builder(&config, credentials, player_support, initial_state);
 
         assert_eq!(
             builder.supported_roles(),
@@ -1840,6 +1837,5 @@ mod tests {
             formats[0].bit_depth
         );
         assert_eq!(advertised.buffer_capacity, PLAYER_BUFFER_CAPACITY);
-        assert_eq!(advertised.supported_commands, vec!["volume".to_string()]);
     }
 }

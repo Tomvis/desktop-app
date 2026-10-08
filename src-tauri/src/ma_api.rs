@@ -4,6 +4,8 @@ use std::time::Duration;
 
 /// Keep synchronous native MA API calls short so app service threads do not stall long.
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pairing waits for the server to re-key and pair the live Sendspin connection.
+const PAIRING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The native callers only need small metadata responses; reject unexpectedly large bodies.
 const MAX_API_RESPONSE_BYTES: u64 = 256 * 1024;
 
@@ -41,10 +43,24 @@ pub(crate) fn current_session() -> Option<Session> {
 
 pub(crate) fn get_active_queue(player_id: &str) -> Result<String, String> {
     post_command_raw(
+        api_agent(),
         "discord-rpc-artwork",
         "player_queues/get_active_queue",
         json!({ "player_id": player_id }),
     )
+}
+
+/// Ask MA to pair this app's Sendspin client, as the built-in web player does
+/// (MA treats a client with manufacturer "Music Assistant" as a web player).
+/// Blocks until MA has paired the connection or given up.
+pub(crate) fn pair_web_player(pairing_token: &str) -> Result<(), String> {
+    post_command_raw(
+        pairing_agent(),
+        "sendspin-pair",
+        "sendspin/pair_web_player",
+        json!({ "pairing_token": pairing_token }),
+    )
+    .map(|_| ())
 }
 
 fn api_agent() -> &'static ureq::Agent {
@@ -57,7 +73,22 @@ fn api_agent() -> &'static ureq::Agent {
     })
 }
 
-fn post_command_raw(message_id: &str, command: &str, args: Value) -> Result<String, String> {
+fn pairing_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(PAIRING_REQUEST_TIMEOUT))
+            .build()
+            .into()
+    })
+}
+
+fn post_command_raw(
+    agent: &ureq::Agent,
+    message_id: &str,
+    command: &str,
+    args: Value,
+) -> Result<String, String> {
     let session =
         current_session().ok_or_else(|| "no active Music Assistant session".to_string())?;
     let api_url = format!("{}/api", session.server_base_url.trim_end_matches('/'));
@@ -69,7 +100,7 @@ fn post_command_raw(message_id: &str, command: &str, args: Value) -> Result<Stri
     .to_string();
 
     let auth_header = format!("Bearer {}", session.auth_token);
-    let mut response = api_agent()
+    let mut response = agent
         .post(api_url)
         .header("Authorization", auth_header)
         .header("Content-Type", "application/json")

@@ -124,7 +124,7 @@ fn distribution() -> Distribution {
     }
 }
 
-const RELEASES_URL: &str = "https://github.com/music-assistant/desktop-app/releases/latest";
+const RELEASES_URL: &str = "https://github.com/Tomvis/desktop-app/releases/latest";
 const DOCS_URL: &str = "https://music-assistant.io/";
 /// Build the macOS menu bar with translated labels.
 #[cfg(target_os = "macos")]
@@ -1012,15 +1012,12 @@ async fn configure_sendspin_for_session(
             loaded_settings.sendspin_player_name.clone()
         };
 
-        // Get or generate a persistent player ID
-        let player_id = if let Some(id) = loaded_settings.sendspin_player_id.clone() {
-            id
-        } else {
-            let new_id = format!("ma_companion_{}", uuid::Uuid::new_v4());
-            // Save the generated ID so it persists across restarts
-            let _ = settings::set_string_setting("sendspin_player_id", Some(new_id.clone()));
-            new_id
-        };
+        // Sendspin's client_id is the public key of the persistent Noise
+        // identity, and MA uses it as the player id.
+        let player_id = sendspin::identity::client_id()?;
+        if loaded_settings.sendspin_player_id.as_deref() != Some(player_id.as_str()) {
+            let _ = settings::set_string_setting("sendspin_player_id", Some(player_id.clone()));
+        }
 
         let config = sendspin::SendspinConfig {
             player_id,

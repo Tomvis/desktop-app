@@ -2,10 +2,10 @@
 //! [`NowPlaying`] snapshot.
 //!
 //! Two protocol facts drive the design:
-//! - `server/state` carries **merge deltas**: a progress tick re-sends
-//!   `metadata` with only `progress` set and `title`/`artist` omitted. We MERGE
-//!   (absent field = keep existing) rather than rebuilding, so progress ticks
-//!   don't wipe the track.
+//! - `server/state` carries the **full** metadata object whenever it includes
+//!   one (a progress tick re-sends title/artist too); an absent field means
+//!   no value and a `null` object clears all metadata. We REPLACE, so a field
+//!   the next track lacks (e.g. artwork) does not linger.
 //! - `group/update.playback_state` is the **only** authoritative play/stop
 //!   signal. `stream/end` arrives late mid-transition and must not touch
 //!   now-playing state.
@@ -47,32 +47,28 @@ impl NowPlayingState {
         }
     }
 
-    /// Apply a `group/update`. Only `playback_state` is authoritative for
-    /// play/stop; an update without it leaves state untouched.
+    /// Apply a `group/update`; its `playback_state` is authoritative for
+    /// play/stop.
     pub fn apply_group_update(&mut self, gu: &GroupUpdate) {
-        if let Some(ps) = &gu.playback_state {
-            self.is_playing = matches!(ps, PlaybackState::Playing);
-        }
+        self.is_playing = matches!(gu.playback_state, PlaybackState::Playing);
     }
 
-    /// Merge a `server/state` metadata delta: a present field overwrites, an
-    /// absent (`None`) field keeps the existing value. serde cannot distinguish
-    /// "absent (keep)" from `"field": null` (clear); we deliberately choose
-    /// keep, since the server signals clears via `group/update: Stopped`, not
-    /// null titles.
-    pub fn apply_metadata(&mut self, md: &MetadataState) {
-        if let Some(title) = &md.title {
-            self.title = Some(title.clone());
-        }
-        if let Some(artist) = &md.artist {
-            self.artist = Some(artist.clone());
-        }
-        if let Some(album) = &md.album {
-            self.album = Some(album.clone());
-        }
-        if let Some(artwork_url) = &md.artwork_url {
-            self.image_url = Some(artwork_url.clone());
-        }
+    /// Apply a `server/state` metadata object: `Some` is the complete new
+    /// metadata, `None` (a `null` object) clears it.
+    pub fn apply_metadata(&mut self, md: Option<&MetadataState>) {
+        let Some(md) = md else {
+            self.title = None;
+            self.artist = None;
+            self.album = None;
+            self.image_url = None;
+            self.elapsed = None;
+            self.duration = None;
+            return;
+        };
+        self.title.clone_from(&md.title);
+        self.artist.clone_from(&md.artist);
+        self.album.clone_from(&md.album);
+        self.image_url.clone_from(&md.artwork_url);
         if let Some(p) = &md.progress {
             // Don't crash on negative values
             self.elapsed = Some(p.track_progress.max(0) as f64 / MILLIS_PER_SEC);
@@ -81,6 +77,9 @@ impl NowPlayingState {
             // elapsed-only instead of a 0:00/0:00 progress bar.
             self.duration =
                 (p.track_duration > 0).then(|| p.track_duration as f64 / MILLIS_PER_SEC);
+        } else {
+            self.elapsed = None;
+            self.duration = None;
         }
     }
 
@@ -120,7 +119,21 @@ mod tests {
         serde_json::from_value(value).expect("test metadata JSON should deserialize")
     }
 
-    /// Empty metadata delta with only `timestamp` and `progress` set.
+    /// Full metadata object for a track at the given position.
+    fn track_at(title: &str, artist: &str, progress_ms: i64, duration_ms: i64) -> MetadataState {
+        metadata_from_json(serde_json::json!({
+            "timestamp": 0,
+            "title": title,
+            "artist": artist,
+            "progress": {
+                "track_progress": progress_ms,
+                "track_duration": duration_ms,
+                "playback_speed": 1000,
+            },
+        }))
+    }
+
+    /// Metadata object with only `timestamp` and `progress` set.
     fn progress_delta(progress_ms: i64, duration_ms: i64) -> MetadataState {
         metadata_from_json(serde_json::json!({
             "timestamp": 0,
@@ -142,20 +155,20 @@ mod tests {
 
     fn group_update(ps: PlaybackState) -> GroupUpdate {
         GroupUpdate {
-            playback_state: Some(ps),
-            group_id: None,
-            group_name: None,
+            playback_state: ps,
+            group_id: "group-1".to_string(),
+            group_name: PLAYER_NAME.to_string(),
         }
     }
 
     #[test]
-    fn progress_only_delta_keeps_track_and_updates_position() {
+    fn progress_tick_carries_full_track_and_updates_position() {
         let mut s = state();
-        s.apply_metadata(&track_delta(TITLE, ARTIST));
+        s.apply_metadata(Some(&track_delta(TITLE, ARTIST)));
 
         let progress_ms = 30_000;
         let duration_ms = 210_000;
-        s.apply_metadata(&progress_delta(progress_ms, duration_ms));
+        s.apply_metadata(Some(&track_at(TITLE, ARTIST, progress_ms, duration_ms)));
 
         let snap = s.snapshot();
         assert_eq!(snap.track.as_deref(), Some(TITLE));
@@ -168,7 +181,7 @@ mod tests {
     fn live_stream_zero_duration_is_absent() {
         let mut s = state();
         let progress_ms = 45_000;
-        s.apply_metadata(&progress_delta(progress_ms, 0));
+        s.apply_metadata(Some(&progress_delta(progress_ms, 0)));
 
         let snap = s.snapshot();
         assert_eq!(snap.elapsed, Some(progress_ms as f64 / MILLIS_PER_SEC));
@@ -181,7 +194,7 @@ mod tests {
     #[test]
     fn negative_progress_clamps_to_track_start() {
         let mut s = state();
-        s.apply_metadata(&progress_delta(-250, 210_000));
+        s.apply_metadata(Some(&progress_delta(-250, 210_000)));
 
         let snap = s.snapshot();
         assert_eq!(snap.elapsed, Some(0.0));
@@ -208,7 +221,7 @@ mod tests {
     #[test]
     fn stopped_keeps_last_metadata() {
         let mut s = state();
-        s.apply_metadata(&track_delta(TITLE, ARTIST));
+        s.apply_metadata(Some(&track_delta(TITLE, ARTIST)));
         s.apply_group_update(&group_update(PlaybackState::Playing));
         s.apply_group_update(&group_update(PlaybackState::Stopped));
 
@@ -222,11 +235,39 @@ mod tests {
     fn metadata_delta_while_stopped_does_not_resume() {
         let mut s = state();
         s.apply_group_update(&group_update(PlaybackState::Stopped));
-        s.apply_metadata(&track_delta(TITLE, ARTIST));
+        s.apply_metadata(Some(&track_delta(TITLE, ARTIST)));
 
         let snap = s.snapshot();
         assert!(!snap.is_playing, "metadata must not flip play state");
         assert_eq!(snap.track.as_deref(), Some(TITLE));
+    }
+
+    #[test]
+    fn full_object_drops_fields_the_new_track_lacks() {
+        let mut s = state();
+        let mut with_art = track_delta(TITLE, ARTIST);
+        with_art.artwork_url = Some("http://example/art.jpg".to_string());
+        with_art.album = Some("Album".to_string());
+        s.apply_metadata(Some(&with_art));
+        s.apply_metadata(Some(&track_delta("Next", ARTIST)));
+
+        let snap = s.snapshot();
+        assert_eq!(snap.track.as_deref(), Some("Next"));
+        assert_eq!(snap.image_url, None);
+        assert_eq!(snap.album, None);
+    }
+
+    #[test]
+    fn null_metadata_clears_everything() {
+        let mut s = state();
+        s.apply_metadata(Some(&track_at(TITLE, ARTIST, 1_000, 2_000)));
+        s.apply_metadata(None);
+
+        let snap = s.snapshot();
+        assert_eq!(snap.track, None);
+        assert_eq!(snap.artist, None);
+        assert_eq!(snap.elapsed, None);
+        assert_eq!(snap.duration, None);
     }
 
     #[test]

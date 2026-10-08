@@ -17,7 +17,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/music-assistant/desktop-app/releases/latest/download/latest.json"
+        "https://github.com/Tomvis/desktop-app/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive",
