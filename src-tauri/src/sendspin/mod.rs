@@ -1041,7 +1041,13 @@ async fn run_authenticated_client(
                     broadcast_volume_state(&sender, resolved_mode, current_volume, current_muted, current_delay_ms, "hardware volume").await;
                 }
             }
-            Some(msg) = messages.recv() => {
+            msg = messages.recv() => {
+                // The session closes its channels when the connection ends;
+                // leave so the outer loop reconnects.
+                let Some(msg) = msg else {
+                    log::info!("[Sendspin] Server connection closed");
+                    break;
+                };
                 match msg {
                     Message::StreamStart(stream_start) => {
                         let Some(player_config) = stream_start.player else {
@@ -1163,7 +1169,11 @@ async fn run_authenticated_client(
                     _ => {}
                 }
             }
-            Some(chunk) = audio.recv() => {
+            chunk = audio.recv() => {
+                let Some(chunk) = chunk else {
+                    log::info!("[Sendspin] Server audio channel closed");
+                    break;
+                };
                 let Some(ref fmt) = audio_format else {
                     continue;
                 };
